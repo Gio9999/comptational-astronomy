@@ -3,6 +3,7 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include <omp.h>
 
 // =====================================================================
 // 1. 參數與結構定義
@@ -10,7 +11,7 @@
 
 #define P_TERMS 4
 #define P_TOTAL ((P_TERMS + 1) * (P_TERMS + 2) / 2)  
-#define MAX_PARTICLES 10   // finest box 粒子數上限
+#define MAX_PARTICLES 40   // finest box 粒子數上限
 
 typedef struct {
     double real;
@@ -89,8 +90,8 @@ Box* create_box(double cx, double cy, double cz, double size, int level, Box* pa
     box->is_leaf = 1;
     
     for (int i = 0; i < 8; i++) box->children[i] = NULL;
-    memset(box->multipole, 0, sizeof(Complex) * P_TOTAL);
-    memset(box->local, 0, sizeof(Complex) * P_TOTAL);
+    memset(box->multipole, 0, sizeof(box->multipole));
+    memset(box->local, 0, sizeof(box->local));
     return box;
 }
 
@@ -179,36 +180,44 @@ Box* get_neighbor(Box* box, int neighbor_index, Box* root) {
 }
 
 // convenient functions
-void init_const_array(double (*pAlm)[2*P_TERMS+1][2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1][2*P_TERMS+1]){
+void init_const_array(double pAlm[][2*P_TERMS+1], double pNlm[][2*P_TERMS+1]){
     double facto[4*P_TERMS + 1];
     facto[0] = 1;
     for(int i=1;i<4*P_TERMS+1;i++) facto[i] = facto[i-1] * (double)i;
 
     for(int l=0;l<2*P_TERMS+1;l++){
         for(int m=0;m<l+1;m++){
-            (*pNlm)[l][m] =sqrt(facto[l-m] / facto[l+m]);
-            (*pAlm)[l][m] =((l%2) ? -1.0:1.0) /sqrt(facto[l-m] * facto[l+m]); 
+            pNlm[l][m] = sqrt(facto[l-m] / facto[l+m]);
+            pAlm[l][m] = ((l%2) ? -1.0:1.0) / sqrt(facto[l-m] * facto[l+m]); 
         }
     }
     return;
 }
 
 
-void get_sph_num(double x1, double x2, double y1, double y2, double z1, double z2, double (*pds)[3] ,double* pr, double* psintheta, double* pcostheta, Complex* pe_iphi){
-    (*pds)[0] = x1 - x2;
-    (*pds)[1] = y1 - y2;
-    (*pds)[2] = z1 - z2;
-    double dxy = pow((*pds)[0], 2) + pow((*pds)[1], 2);
-    *pr = dxy + pow((*pds)[2], 2);
-    *pr = sqrt(*pr);
-    *pcostheta = (*pds)[2] / *pr;
-    *psintheta = sqrt(dxy) / *pr;
-    pe_iphi->real = (*pds)[0] / sqrt(dxy);
-    pe_iphi->imag = (*pds)[1] / sqrt(dxy);
+void get_sph_num(double x1, double x2, double y1, double y2, double z1, double z2, double pds[3] ,double* pr, double* psintheta, double* pcostheta, Complex* pe_iphi, double L0){
+    pds[0] = x1 - x2;
+    pds[1] = y1 - y2;
+    pds[2] = z1 - z2;
+    double dxy = pow(pds[0], 2) + pow(pds[1], 2);
+    double r_abs = sqrt(dxy + pds[2] * pds[2]);
+    if (r_abs < 1e-12) r_abs = 1e-12;
+    *pr = r_abs;
+
+    *pcostheta = pds[2] / r_abs;
+    double sqrt_dxy = sqrt(dxy);
+    *psintheta = sqrt_dxy / r_abs;
+    if (sqrt_dxy < 1e-12){
+        pe_iphi->real = 1.0;
+        pe_iphi->imag = 0.0;
+    }else{
+        pe_iphi->real = pds[0] / sqrt_dxy;
+        pe_iphi->imag = pds[1] / sqrt_dxy;
+    }
     return;
 }
 
-void get_P(int Pscale, double sintheta, double costheta, double (*pPlm)[Pscale]){
+void get_P(int Pscale, double sintheta, double costheta, double pPlm[][2*P_TERMS+1]){
     // for L2M    Pscale = 2*m + 1
     // for others Pscale = m + 1
     (pPlm)[0][0] = 1.0;
@@ -225,7 +234,7 @@ void get_P(int Pscale, double sintheta, double costheta, double (*pPlm)[Pscale])
     return;
 }
 
-void get_Y(int Yscale, Complex e_iphi, double (*pPlm)[Yscale], Complex (*pYlm)[Yscale], double (*pNlm)[2*P_TERMS+1]){
+void get_Y(int Yscale, Complex e_iphi, double pPlm[][2*P_TERMS+1], Complex pYlm[][2*P_TERMS+1], double pNlm[][2*P_TERMS+1]){
     for(int l=0;l<Yscale;l++){
         Complex exp_now = make_complex(1, 0);
         for(int m=0;m<=l;m++){
@@ -246,11 +255,11 @@ void p2m(Box* box, Particle* particles, double (*pNlm)[2*P_TERMS+1]) {
 
     for (int i = 0; i < box->num_particles; i++){
         Particle* p = &particles[box->particle_indices[i]];
-        double ds[3], r, sintheta, costheta, Plm[P_TERMS+1][P_TERMS+1];
-        Complex e_iphi, Ylm[P_TERMS+1][P_TERMS+1];
+        double ds[3], r, sintheta, costheta, Plm[2*P_TERMS+1][2*P_TERMS+1];
+        Complex e_iphi, Ylm[2*P_TERMS+1][2*P_TERMS+1];
 
         get_sph_num(p->x, box->cx, p->y, box->cy, p->z, box->cz, 
-                      ds, &r, &sintheta, &costheta, &e_iphi);
+                      ds, &r, &sintheta, &costheta, &e_iphi, 1.0);
         get_P(P_TERMS + 1, sintheta, costheta, Plm);
         get_Y(P_TERMS + 1, e_iphi, Plm, Ylm, pNlm);
         double r_now = 1;
@@ -259,8 +268,12 @@ void p2m(Box* box, Particle* particles, double (*pNlm)[2*P_TERMS+1]) {
             double coeff_indep_m = p->charge * pow(r_now, l);
             for(int m=-l;m<=l;m++){
                 Complex flag;
-                if(m>=0) flag = c_conj(Ylm[l][m]);
-                else flag = Ylm[l][m];
+                if(m>=0){
+                    flag = c_conj(Ylm[l][m]);
+                }else{
+                    flag = Ylm[l][-m];
+                    if ((-m)%2 != 0) flag = c_mul_real(flag, -1.0);
+                }
                 box->multipole[l][P_TERMS+m] =c_add(box->multipole[l][P_TERMS+m],c_mul_real(flag, coeff_indep_m));
             }
             r_now *= r;
@@ -269,13 +282,14 @@ void p2m(Box* box, Particle* particles, double (*pNlm)[2*P_TERMS+1]) {
 }
 
 void m2m(Box* parent, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) {
-    memset(parent->multipole, 0, sizeof(Complex) * P_TOTAL);
+    memset(parent->multipole, 0, sizeof(parent->multipole));
     Complex i_power[4] = {make_complex(1, 0), make_complex(0, 1), make_complex(-1, 0), make_complex(0, -1)};
     for(int i=0;i<8;i++){
-        double ds[3], r, sintheta, costheta, Plm[P_TERMS+1][P_TERMS+1];
-        Complex e_iphi, Ylm[P_TERMS+1][P_TERMS+1];
+        double ds[3], r, sintheta, costheta, Plm[2*P_TERMS+1][2*P_TERMS+1];
+        Complex e_iphi, Ylm[2*P_TERMS+1][2*P_TERMS+1];
         Box *child = parent->children[i];
-        get_sph_num(child->cx, parent->cx, child->cy, parent->cy, child->cz, parent->cz, ds, &r, &sintheta, &costheta, &e_iphi);
+        if (!child) continue;
+        get_sph_num(child->cx, parent->cx, child->cy, parent->cy, child->cz, parent->cz, ds, &r, &sintheta, &costheta, &e_iphi, 1.0);
         get_P(P_TERMS+1, sintheta, costheta, Plm);
         get_Y(P_TERMS+1, e_iphi, Plm, Ylm, pNlm);
 
@@ -310,10 +324,11 @@ void m2m(Box* parent, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) 
 }
 
 void m2l(Box* target, Box* source, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) {
+    double scale = target->size;
     double ds[3], r, sintheta, costheta, Plm[2*P_TERMS+1][2*P_TERMS+1];
     Complex e_iphi, Ylm[2*P_TERMS+1][2*P_TERMS+1];
     Complex i_power[4] = {make_complex(1, 0), make_complex(0, 1), make_complex(-1, 0), make_complex(0, -1)};
-    get_sph_num(source->cx, target->cx, source->cy, target->cy, source->cz, target->cz, ds, &r, &sintheta, &costheta, &e_iphi);
+    get_sph_num(source->cx, target->cx, source->cy, target->cy, source->cz, target->cz, ds, &r, &sintheta, &costheta, &e_iphi, 1.0);
     get_P(2*P_TERMS+1, sintheta, costheta, Plm);
     get_Y(2*P_TERMS+1, e_iphi, Plm, Ylm, pNlm);
 
@@ -325,8 +340,12 @@ void m2l(Box* target, Box* source, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2
             for(int n=0;n<=P_TERMS;n++){
                 for(int m=-n;m<=n;m++){
                     Complex flag;
-                    if(m-k<0) flag = make_complex(Ylm[j+n][-m+k].real, -Ylm[j+n][-m+k].imag);
-                    else flag = Ylm[j+n][m-k];
+                    if(m-k<0){
+                        flag = make_complex(Ylm[j+n][-m+k].real, -Ylm[j+n][-m+k].imag);
+                        if((k-m)%2 != 0) flag = c_mul_real(flag, -1.0);
+                    }else{
+                        flag = Ylm[j+n][m-k];
+                    }
 
                     add_num = c_add(add_num, 
                                 c_mul_real(
@@ -352,7 +371,7 @@ void l2l(Box* parent, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) 
         if(!child) continue;
         double ds[3], r, sintheta, costheta, Plm[2*P_TERMS+1][2*P_TERMS+1];
         Complex e_iphi, Ylm[2*P_TERMS+1][2*P_TERMS+1];
-        get_sph_num(child->cx, parent->cx, child->cy, parent->cy, child->cz, parent->cz, ds, &r, &sintheta, &costheta, &e_iphi);
+        get_sph_num(child->cx, parent->cx, child->cy, parent->cy, child->cz, parent->cz, ds, &r, &sintheta, &costheta, &e_iphi, 1.0);
         get_P(2*P_TERMS+1, sintheta, costheta, Plm);
         get_Y(2*P_TERMS+1, e_iphi, Plm, Ylm, pNlm);
 
@@ -385,9 +404,9 @@ void l2p(Box* box, Particle* particles, double (*pAlm)[2*P_TERMS+1], double (*pN
     if (!box->is_leaf) return;
     for (int i = 0; i < box->num_particles; i++) {
         Particle* p = &particles[box->particle_indices[i]];
-        double ds[3], r, sintheta, costheta, Plm[P_TERMS+1][P_TERMS+1];
-        Complex e_iphi, Ylm[P_TERMS+1][P_TERMS+1];
-        get_sph_num(p->x, box->cx, p->y, box->cy, p->z, box->cz, ds, &r, &sintheta, &costheta, &e_iphi);
+        double ds[3], r, sintheta, costheta, Plm[2*P_TERMS+1][2*P_TERMS+1];
+        Complex e_iphi, Ylm[2*P_TERMS+1][2*P_TERMS+1];
+        get_sph_num(p->x, box->cx, p->y, box->cy, p->z, box->cz, ds, &r, &sintheta, &costheta, &e_iphi, 1.0);
         get_P(P_TERMS+1, sintheta, costheta, Plm);
         get_Y(P_TERMS+1, e_iphi, Plm, Ylm, pNlm);
 
@@ -442,7 +461,10 @@ void compute_m2l(Box* target_box, Box* root, double (*pAlm)[2*P_TERMS+1], double
 }
 
 void downward_pass(Box* box, Box* root, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) {
-    compute_m2l(box, root, pAlm, pNlm);
+    if (box->is_leaf){
+        compute_m2l(box, root, pAlm, pNlm);
+    }
+    
     l2l(box, pAlm, pNlm); 
     
     if (!box->is_leaf) {
@@ -457,8 +479,10 @@ void compute_near_field_uniform(Box* target_leaf, Box* neighbor_leaf, Particle* 
     if (!neighbor_leaf || !neighbor_leaf->is_leaf) return;
 
     for (int i = 0; i < target_leaf->num_particles; i++) {
+        int idx1 = target_leaf->particle_indices[i];
+        double pot_accum = 0.0;
+
         for (int j = 0; j < neighbor_leaf->num_particles; j++) {
-            int idx1 = target_leaf->particle_indices[i];
             int idx2 = neighbor_leaf->particle_indices[j];
 
             double dx = particles[idx1].x - particles[idx2].x;
@@ -467,43 +491,86 @@ void compute_near_field_uniform(Box* target_leaf, Box* neighbor_leaf, Particle* 
             double r = sqrt(dx*dx + dy*dy + dz*dz);
 
             if (r > 1e-10) {
-                // 雙向加總
-                particles[idx1].potential += particles[idx2].charge / r;
-                particles[idx2].potential += particles[idx1].charge / r;
+                pot_accum += particles[idx2].charge / r;
             }
+        }
+        particles[idx1].potential += pot_accum;
+    }
+}
+
+// 預處理節點以進行 parallel
+void collect_leaves(Box* box, Box** leaf_array, int* count){
+    if (!box) return;
+    if (box->is_leaf){
+        leaf_array[*count] = box;
+        (*count)++;
+    }else{
+        for(int i = 0; i < 8; i++){
+            collect_leaves(box->children[i], leaf_array, count);
         }
     }
 }
 
-void evaluate(Box* box, Box* root, Particle* particles, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) {
-    if (box->is_leaf) {
-        l2p(box, particles, pAlm, pNlm); 
+int count_leaves(Box* box){
+    if(!box) return 0;
 
-        // (a) 盒內粒子對（自身 vs 自身）
+    if(box->is_leaf)
+        return 1;
+
+    int total = 0;
+    for(int i=0;i<8;i++)
+        total += count_leaves(box->children[i]);
+
+    return total;
+}
+
+void evaluate(Box* root, Particle* particles, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) {
+    Box* leaf_array[32768];
+    int leaf_count = 0;
+    collect_leaves(root, leaf_array, &leaf_count);
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int k = 0; k < leaf_count; k++){
+        Box* box = leaf_array[k];
+
+        // (a) 遠場l2p
+        l2p(box, particles, pAlm, pNlm);
+    
+        // (b) 近場（自身與鄰居）
         for (int i = 0; i < box->num_particles; i++) {
-            for (int j = i + 1; j < box->num_particles; j++) {
-                int idx1 = box->particle_indices[i];
+            int idx1 = box->particle_indices[i];
+            double pot_accum = 0.0;
+            // 自身＋自身
+            for (int j = 0; j < box->num_particles; j++) {
+                if (i == j) continue;
                 int idx2 = box->particle_indices[j];
                 double dx = particles[idx1].x - particles[idx2].x;
                 double dy = particles[idx1].y - particles[idx2].y;
                 double dz = particles[idx1].z - particles[idx2].z;
                 double r = sqrt(dx*dx + dy*dy + dz*dz);
                 if (r > 1e-10) {
-                    particles[idx1].potential += particles[idx2].charge / r;
-                    particles[idx2].potential += particles[idx1].charge / r;
+                    pot_accum += particles[idx2].charge / r;
                 }
             }
-        }
 
-        // (b) 與鄰居盒子的粒子對：只取 n > 13 的方向，搭配上面雙向加總避免重複
-        for (int n = 14; n < 27; n++) {
-            Box* neighbor = get_neighbor(box, n, root);
-            if (!neighbor) continue;
-            compute_near_field_uniform(box, neighbor, particles);
-        }
-    } else {
-        for (int i = 0; i < 8; i++) {
-            if (box->children[i]) evaluate(box->children[i], root, particles, pAlm, pNlm);
+            // 與鄰居盒子的粒子對：前面改成單向，所以要把所有方向都算進去
+            for (int n = 0; n < 27; n++) {
+                if (n == 13) continue;
+                Box* neighbor = get_neighbor(box, n, root);
+                if (!neighbor || !neighbor->is_leaf) continue;
+
+                for (int j = 0; j < neighbor->num_particles; j++){
+                    int idx2 = neighbor->particle_indices[j];
+                    double dx = particles[idx1].x - particles[idx2].x;
+                    double dy = particles[idx1].y - particles[idx2].y;
+                    double dz = particles[idx1].z - particles[idx2].z;
+                    double r = sqrt(dx*dx + dy*dy + dz*dz);
+                    if (r > 1e-10) {
+                        pot_accum += particles[idx2].charge / r;
+                    }
+                }
+            }
+            particles[idx1].potential += pot_accum;
         }
     }
 }
@@ -517,9 +584,13 @@ void free_tree(Box* box) {
     free(box);
 }
 
-int main() {
-    int N = 500;
+int main(int argc, char* argv[]) {
+    int N = 5000;
+    if (argc > 1) N = atoi(argv[1]);
+
     int MAX_LEVEL=(int)(log((double)N / MAX_PARTICLES) / log(8.0));
+    //if (MAX_LEVEL > 3) MAX_LEVEL = 3;
+    if (MAX_LEVEL < 0) MAX_LEVEL = 0;
     double Nlm[2*P_TERMS+1][2*P_TERMS+1], Alm[2*P_TERMS+1][2*P_TERMS+1]; // some const array needed for P2M and etc...
     Particle* particles = (Particle*)malloc(sizeof(Particle) * N);
 
@@ -532,36 +603,60 @@ int main() {
         particles[i].potential = 0.0;
     }
     // build Nlm,Alm
-    init_const_array(&Alm, &Nlm);
+    init_const_array(Alm, Nlm);
+
+    // FMM
+    double fmm_start = omp_get_wtime();
 
     // 建立根節點
     Box* root = create_box(0.5, 0.5, 0.5, 1.0, 0, NULL);
     build_uniform_tree(root,MAX_LEVEL);
     for (int i = 0; i < N; i++) insert_particle(root, i, particles);
 
-    upward_pass(root, particles, &Alm, &Nlm);
-    downward_pass(root, root, &Alm, &Nlm);
-    evaluate(root, root, particles, &Alm, &Nlm);
+    upward_pass(root, particles, Alm, Nlm);
+    downward_pass(root, root, Alm, Nlm);
+    evaluate(root, particles, Alm, Nlm);
+
+    double fmm_end = omp_get_wtime();
+    double fmm_time = fmm_end - fmm_start;
+    printf("FMM Time        : %f seconds\n", fmm_time);
+
     double total_potential_di = 0;
     double total_potential_fmm = 0;
-    double direct_pot = 0;
     double error = 0.;
-    for (int i = 0; i < N; i++) {
-        direct_pot = 0;
-        for (int j = 0; j < N; j++) {
-            if (i != j)
-            {
-            double r = sqrt(pow(particles[i].x-particles[j].x,2)+pow(particles[i].y-particles[j].y,2)+pow(particles[i].z-particles[j].z,2));
-            if (r > 1e-10) direct_pot += particles[i].charge / r;
+
+    // Direct sum
+    double dir_start = omp_get_wtime();
+    int dir_limit = 1000000;
+    if (N <= dir_limit){
+        #pragma omp parallel for reduction(+:total_potential_di, total_potential_fmm) schedule(guided)
+        for (int i = 0; i < N; i++) {
+            double direct_pot = 0;
+            for (int j = 0; j < N; j++) {
+                if (i != j)
+                {
+                double r = sqrt(pow(particles[i].x-particles[j].x,2)+pow(particles[i].y-particles[j].y,2)+pow(particles[i].z-particles[j].z,2));
+                if (r > 1e-10) direct_pot += particles[j].charge / r;
+                }
             }
+            total_potential_fmm += fabs(particles[i].potential);
+            total_potential_di += fabs(direct_pot);
         }
-        total_potential_fmm += fabs(particles[i].potential);
-        total_potential_di += fabs(direct_pot);
     }
-    error = fabs(total_potential_fmm - total_potential_di) / fabs(total_potential_di);
-    printf("Error of the Energy: %e\n", error);
-    printf("Total potential by direct summation: %e\n", total_potential_di);
-    printf("Total potential by FMM: %e\n", total_potential_fmm);
+    double dir_end = omp_get_wtime();
+    double dir_time = dir_end - dir_start;
+
+    if (N <= dir_limit){
+        printf("Direct Sum Time : %f seconds\n", dir_time);
+        printf("Speedup         : %.2fx\n", dir_time / fmm_time);
+        error = fabs(total_potential_fmm - total_potential_di) / fabs(total_potential_di);
+
+        printf("Error of the Energy                 : %e\n", error);
+    }
+    printf("Total potential by FMM              : %e\n", total_potential_fmm);
+    if (N <= dir_limit) printf("Total potential by direct summation : %e\n", total_potential_di);
+
+
     free_tree(root);
     free(particles);
     return 0;
