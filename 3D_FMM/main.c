@@ -9,7 +9,7 @@
 // 1. 參數與結構定義
 // =====================================================================
 
-#define P_TERMS 4
+#define P_TERMS 10
 #define P_TOTAL ((P_TERMS + 1) * (P_TERMS + 2) / 2)  
 #define MAX_PARTICLES 40   // finest box 粒子數上限
 
@@ -272,7 +272,7 @@ void p2m(Box* box, Particle* particles, double (*pNlm)[2*P_TERMS+1]) {
                     flag = c_conj(Ylm[l][m]);
                 }else{
                     flag = Ylm[l][-m];
-                    if ((-m)%2 != 0) flag = c_mul_real(flag, -1.0);
+
                 }
                 box->multipole[l][P_TERMS+m] =c_add(box->multipole[l][P_TERMS+m],c_mul_real(flag, coeff_indep_m));
             }
@@ -371,7 +371,7 @@ void l2l(Box* parent, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) 
         if(!child) continue;
         double ds[3], r, sintheta, costheta, Plm[2*P_TERMS+1][2*P_TERMS+1];
         Complex e_iphi, Ylm[2*P_TERMS+1][2*P_TERMS+1];
-        get_sph_num(child->cx, parent->cx, child->cy, parent->cy, child->cz, parent->cz, ds, &r, &sintheta, &costheta, &e_iphi, 1.0);
+        get_sph_num(parent->cx, child->cx, parent->cy, child->cy, parent->cz, child->cz, ds, &r, &sintheta, &costheta, &e_iphi, 1.0);
         get_P(2*P_TERMS+1, sintheta, costheta, Plm);
         get_Y(2*P_TERMS+1, e_iphi, Plm, Ylm, pNlm);
 
@@ -382,8 +382,9 @@ void l2l(Box* parent, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) 
                 for(int n=j;n<=P_TERMS;n++){
                     double rnow = pow(r, n-j), mn_power[2]={1, -1};
                     for(int m=-n;m<=n;m++){
+                        if(abs(m-k) > n-j) continue;
                         Complex flag;
-                        if(m-k>0) flag = Ylm[n-j][m-k];
+                        if(m-k>=0) flag = Ylm[n-j][m-k];
                         else flag = c_conj(Ylm[n-j][k-m]);
                         add_num = c_add(add_num,
                             c_mul_real(
@@ -442,34 +443,48 @@ void upward_pass(Box* box, Particle* particles, double (*pAlm)[2*P_TERMS+1], dou
     }
 }
 
-void compute_m2l(Box* target_box, Box* root, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) {
-    Box* parent = target_box->parent;
+void compute_m2l(Box* target, Box* root,
+                          double (*pAlm)[2*P_TERMS+1],
+                          double (*pNlm)[2*P_TERMS+1]) {
+    Box* parent = target->parent;
     if (!parent) return;
-
+    int count = 0;
     for (int i = 0; i < 27; i++) {
         Box* p_neighbor = get_neighbor(parent, i, root);
         if (!p_neighbor) continue;
-
-        // 均勻網格中，p_neighbor 絕對不是葉子，直接去抓它的 8 個子盒子即可
-        for (int j = 0; j < 8; j++) {
-            Box* candidate = p_neighbor->children[j];
-            if (candidate && !is_neighbor(target_box, candidate)) {
-                m2l(target_box, candidate, pAlm, pNlm);
+        if (!p_neighbor->is_leaf) {
+            for (int j = 0; j < 8; j++) {
+                Box* candidate = p_neighbor->children[j];
+                if (candidate && !is_neighbor(target, candidate)) {
+                    m2l(target, candidate, pAlm, pNlm);
+                    count++;
+                }
+            }
+        } else {
+            if (!is_neighbor(target, p_neighbor)) {
+                m2l(target, p_neighbor, pAlm, pNlm);
+                count++;
             }
         }
     }
 }
 
-void downward_pass(Box* box, Box* root, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) {
-    if (box->is_leaf){
-        compute_m2l(box, root, pAlm, pNlm);
-    }
-    
-    l2l(box, pAlm, pNlm); 
-    
+
+
+
+void downward_pass(Box* box, Box* root,
+                   double (*pAlm)[2*P_TERMS+1],
+                   double (*pNlm)[2*P_TERMS+1]) {
+    // 所有非根節點都做 M2L（不限葉子）
+    compute_m2l(box, root, pAlm, pNlm);
+
+    // L2L：把自身的 local 往子節點傳
+    l2l(box, pAlm, pNlm);
+
     if (!box->is_leaf) {
         for (int i = 0; i < 8; i++) {
-            if (box->children[i]) downward_pass(box->children[i], root, pAlm, pNlm);
+            if (box->children[i])
+                downward_pass(box->children[i], root, pAlm, pNlm);
         }
     }
 }
@@ -590,6 +605,7 @@ int main(int argc, char* argv[]) {
 
     int MAX_LEVEL=(int)(log((double)N / MAX_PARTICLES) / log(8.0));
     //if (MAX_LEVEL > 3) MAX_LEVEL = 3;
+    //MAX_LEVEL = 3;
     if (MAX_LEVEL < 0) MAX_LEVEL = 0;
     double Nlm[2*P_TERMS+1][2*P_TERMS+1], Alm[2*P_TERMS+1][2*P_TERMS+1]; // some const array needed for P2M and etc...
     Particle* particles = (Particle*)malloc(sizeof(Particle) * N);
@@ -621,15 +637,15 @@ int main(int argc, char* argv[]) {
     double fmm_time = fmm_end - fmm_start;
     printf("FMM Time        : %f seconds\n", fmm_time);
 
-    double total_potential_di = 0;
-    double total_potential_fmm = 0;
-    double error = 0.;
+    double err2 = 0.0;
+    double ref2 = 0.0;
+    double error = 0.0;
 
     // Direct sum
     double dir_start = omp_get_wtime();
-    int dir_limit = 1000000;
+    int dir_limit = 10000000;
     if (N <= dir_limit){
-        #pragma omp parallel for reduction(+:total_potential_di, total_potential_fmm) schedule(guided)
+        #pragma omp parallel for reduction(+:err2, ref2) schedule(guided)
         for (int i = 0; i < N; i++) {
             double direct_pot = 0;
             for (int j = 0; j < N; j++) {
@@ -639,8 +655,9 @@ int main(int argc, char* argv[]) {
                 if (r > 1e-10) direct_pot += particles[j].charge / r;
                 }
             }
-            total_potential_fmm += fabs(particles[i].potential);
-            total_potential_di += fabs(direct_pot);
+            double diff = particles[i].potential - direct_pot;
+            err2 += diff*diff;
+            ref2 += direct_pot*direct_pot;
         }
     }
     double dir_end = omp_get_wtime();
@@ -649,12 +666,10 @@ int main(int argc, char* argv[]) {
     if (N <= dir_limit){
         printf("Direct Sum Time : %f seconds\n", dir_time);
         printf("Speedup         : %.2fx\n", dir_time / fmm_time);
-        error = fabs(total_potential_fmm - total_potential_di) / fabs(total_potential_di);
+        error = sqrt(err2/ref2);
 
-        printf("Error of the Energy                 : %e\n", error);
+        printf("L2 Error        : %e\n", error);
     }
-    printf("Total potential by FMM              : %e\n", total_potential_fmm);
-    if (N <= dir_limit) printf("Total potential by direct summation : %e\n", total_potential_di);
 
 
     free_tree(root);
