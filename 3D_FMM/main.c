@@ -36,6 +36,7 @@ typedef struct Box {
     
     struct Box* parent;     
     struct Box* children[8];
+    struct Box* neighbors[27];
     
     Complex multipole[P_TERMS+1][2*P_TERMS+1]; 
     Complex local[P_TERMS+1][2*P_TERMS+1];     
@@ -90,6 +91,7 @@ Box* create_box(double cx, double cy, double cz, double size, int level, Box* pa
     box->is_leaf = 1;
     
     for (int i = 0; i < 8; i++) box->children[i] = NULL;
+    for (int i = 0; i < 27; i++) box->neighbors[i] = NULL;
     memset(box->multipole, 0, sizeof(box->multipole));
     memset(box->local, 0, sizeof(box->local));
     return box;
@@ -244,6 +246,30 @@ void get_Y(int Yscale, Complex e_iphi, double pPlm[][2*P_TERMS+1], Complex pYlm[
         }
     }
     return;
+}
+
+void collect_level_nodes(Box* box, int target_level, Box** node_array, int* count) {
+    if (!box) return;
+    if (box->level == target_level) {
+        node_array[*count] = box;
+        (*count)++;
+        return;
+    }
+    if (!box->is_leaf) {
+        for (int i = 0; i < 8; i++) {
+            collect_level_nodes(box->children[i], target_level, node_array, count);
+        }
+    }
+}
+
+void precompute_all_neighbors(Box* box, Box* root) {
+    if (!box) return;
+    for (int n = 0; n < 27; n++) {
+        box->neighbors[n] = get_neighbor(box, n, root);
+    }
+    if (!box->is_leaf) {
+        for (int i = 0; i < 8; i++) precompute_all_neighbors(box->children[i], root);
+    }
 }
 
 // Do not touch
@@ -436,14 +462,27 @@ void l2p(Box* box, Particle* particles, double (*pAlm)[2*P_TERMS+1], double (*pN
 // 運算執行
 // =====================================================================
 
-void upward_pass(Box* box, Particle* particles, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) {
-    if (box->is_leaf) {
-        p2m(box, particles, pNlm);
-    } else {
-        for (int i = 0; i < 8; i++) {
-            if (box->children[i]) upward_pass(box->children[i], particles, pAlm, pNlm);
+void upward_pass(Box* root, Particle* particles, int MAX_LEVEL, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) {
+    Box** leaf_nodes = (Box**)malloc(sizeof(Box*) * 524288);
+    int leaf_count = 0;
+    collect_level_nodes(root, MAX_LEVEL, leaf_nodes, &leaf_count);
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < leaf_count; i++) {
+        p2m(leaf_nodes[i], particles, pNlm);
+    }
+    free(leaf_nodes);
+
+    for (int lv = MAX_LEVEL - 1; lv >= 0; lv--) {
+        Box** level_nodes = (Box**)malloc(sizeof(Box*) * 524288);
+        int node_count = 0;
+        collect_level_nodes(root, lv, level_nodes, &node_count);
+
+        #pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < node_count; i++) {
+            m2m(level_nodes[i], pAlm, pNlm);
         }
-        m2m(box, pAlm, pNlm);
+        free(level_nodes);
     }
 }
 
@@ -454,7 +493,7 @@ void compute_m2l(Box* target, Box* root,
     if (!parent) return;
     int count = 0;
     for (int i = 0; i < 27; i++) {
-        Box* p_neighbor = get_neighbor(parent, i, root);
+        Box* p_neighbor = parent->neighbors[i];
         if (!p_neighbor) continue;
         if (!p_neighbor->is_leaf) {
             for (int j = 0; j < 8; j++) {
@@ -474,22 +513,25 @@ void compute_m2l(Box* target, Box* root,
 }
 
 
+void downward_pass(Box* root, int MAX_LEVEL, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) {
+    for (int lv = 0; lv <= MAX_LEVEL; lv++) {
+        Box** level_nodes = (Box**)malloc(sizeof(Box*) * 524288);
+        int node_count = 0;
+        collect_level_nodes(root, lv, level_nodes, &node_count);
 
-
-void downward_pass(Box* box, Box* root,
-                   double (*pAlm)[2*P_TERMS+1],
-                   double (*pNlm)[2*P_TERMS+1]) {
-    // 所有非根節點都做 M2L（不限葉子）
-    compute_m2l(box, root, pAlm, pNlm);
-
-    // L2L：把自身的 local 往子節點傳
-    l2l(box, pAlm, pNlm);
-
-    if (!box->is_leaf) {
-        for (int i = 0; i < 8; i++) {
-            if (box->children[i])
-                downward_pass(box->children[i], root, pAlm, pNlm);
+        // 所有非根節點都做 M2L（不限葉子）
+        #pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < node_count; i++) {
+            compute_m2l(level_nodes[i], root, pAlm, pNlm);
         }
+
+        // L2L：把自身的 local 往子節點傳
+        #pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < node_count; i++) {
+            l2l(level_nodes[i], pAlm, pNlm);
+        }
+
+        free(level_nodes);
     }
 }
 
@@ -575,7 +617,7 @@ void evaluate(Box* root, Particle* particles, double (*pAlm)[2*P_TERMS+1], doubl
             // 與鄰居盒子的粒子對：前面改成單向，所以要把所有方向都算進去
             for (int n = 0; n < 27; n++) {
                 if (n == 13) continue;
-                Box* neighbor = get_neighbor(box, n, root);
+                Box* neighbor = box->neighbors[n];
                 if (!neighbor || !neighbor->is_leaf) continue;
 
                 for (int j = 0; j < neighbor->num_particles; j++){
@@ -635,9 +677,10 @@ int main(int argc, char* argv[]) {
     Box* root = create_box(0.5, 0.5, 0.5, 1.0, 0, NULL);
     build_uniform_tree(root,MAX_LEVEL);
     for (int i = 0; i < N; i++) insert_particle(root, i, particles);
+    precompute_all_neighbors(root, root);
 
-    upward_pass(root, particles, Alm, Nlm);
-    downward_pass(root, root, Alm, Nlm);
+    upward_pass(root, particles, MAX_LEVEL, Alm, Nlm);
+    downward_pass(root, MAX_LEVEL, Alm, Nlm);
     evaluate(root, particles, Alm, Nlm);
 
     double fmm_end = omp_get_wtime();
