@@ -146,6 +146,7 @@ Box* find_box(Box* current, double x, double y, double z, int target_level) {
     }
 
     if (current->level == target_level || current->is_leaf) return current;
+    if (current->is_leaf) return NULL;
 
     int idx = 0;
     if (x > current->cx) idx |= 1;
@@ -226,7 +227,7 @@ void get_P(int Pscale, double sintheta, double costheta, double pPlm[][2*P_TERMS
         (pPlm)[m+1][m]   =  (2*m + 1) * costheta * (pPlm)[m][m];
     }
     for(int l=2;l<=Pscale-1;l++){
-        for(int m=0;m<l;m++){
+        for(int m=0;m<l-1;m++){
             (pPlm)[l][m] = (double)(2*l - 1) / (l - m) * costheta * (pPlm)[l-1][m] 
                           - (double)(l + m - 1) / (l - m) * (pPlm)[l-2][m];
         }
@@ -265,7 +266,7 @@ void p2m(Box* box, Particle* particles, double (*pNlm)[2*P_TERMS+1]) {
         double r_now = 1;
         // rnow => r^l
         for(int l=0;l<P_TERMS+1;l++){
-            double coeff_indep_m = p->charge * pow(r_now, l);
+            double coeff_indep_m = p->charge * r_now;
             for(int m=-l;m<=l;m++){
                 Complex flag;
                 if(m>=0){
@@ -342,7 +343,6 @@ void m2l(Box* target, Box* source, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2
                     Complex flag;
                     if(m-k<0){
                         flag = make_complex(Ylm[j+n][-m+k].real, -Ylm[j+n][-m+k].imag);
-                        if((k-m)%2 != 0) flag = c_mul_real(flag, -1.0);
                     }else{
                         flag = Ylm[j+n][m-k];
                     }
@@ -371,7 +371,11 @@ void l2l(Box* parent, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) 
         if(!child) continue;
         double ds[3], r, sintheta, costheta, Plm[2*P_TERMS+1][2*P_TERMS+1];
         Complex e_iphi, Ylm[2*P_TERMS+1][2*P_TERMS+1];
-        get_sph_num(parent->cx, child->cx, parent->cy, child->cy, parent->cz, child->cz, ds, &r, &sintheta, &costheta, &e_iphi, 1.0);
+
+        memset(Plm, 0, sizeof(Plm));
+        memset(Ylm, 0, sizeof(Ylm));
+
+        get_sph_num(child->cx, parent->cx, child->cy, parent->cy, child->cz, parent->cz, ds, &r, &sintheta, &costheta, &e_iphi, 1.0);
         get_P(2*P_TERMS+1, sintheta, costheta, Plm);
         get_Y(2*P_TERMS+1, e_iphi, Plm, Ylm, pNlm);
 
@@ -380,18 +384,18 @@ void l2l(Box* parent, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) 
             for(int k=-j;k<=j;k++){
                 Complex add_num = make_complex(0, 0);
                 for(int n=j;n<=P_TERMS;n++){
-                    double rnow = pow(r, n-j), mn_power[2]={1, -1};
+                    double rnow = pow(r, n-j);
                     for(int m=-n;m<=n;m++){
                         if(abs(m-k) > n-j) continue;
                         Complex flag;
-                        if(m-k>=0) flag = Ylm[n-j][m-k];
+                        if(m-k>0) flag = Ylm[n-j][m-k];
                         else flag = c_conj(Ylm[n-j][k-m]);
                         add_num = c_add(add_num,
                             c_mul_real(
                                 c_mul_c(
                                     c_mul_c(Olm[n][P_TERMS+m], i_power[((abs(m)-abs(m-k)-abs(k))%4+4)%4]),
                                     flag),
-                                pAlm[n-j][abs(m-k)] * pAlm[j][abs(k)] * rnow / (mn_power[((n+j)%2+2)%2] * pAlm[n][abs(m)])));                        
+                                pAlm[n-j][abs(m-k)] * pAlm[j][abs(k)] * rnow / pAlm[n][abs(m)]));                    
                     }
 
                 }
@@ -540,7 +544,7 @@ int count_leaves(Box* box){
 }
 
 void evaluate(Box* root, Particle* particles, double (*pAlm)[2*P_TERMS+1], double (*pNlm)[2*P_TERMS+1]) {
-    Box* leaf_array[32768];
+    Box* leaf_array[262144];
     int leaf_count = 0;
     collect_leaves(root, leaf_array, &leaf_count);
 
@@ -601,7 +605,10 @@ void free_tree(Box* box) {
 
 int main(int argc, char* argv[]) {
     int N = 5000;
+    int target_cpus = 8;
     if (argc > 1) N = atoi(argv[1]);
+    if (argc > 2) target_cpus = atoi(argv[2]);
+    omp_set_num_threads(target_cpus);
 
     int MAX_LEVEL=(int)(log((double)N / MAX_PARTICLES) / log(8.0));
     //if (MAX_LEVEL > 3) MAX_LEVEL = 3;
